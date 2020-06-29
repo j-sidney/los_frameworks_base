@@ -68,11 +68,11 @@ public interface NetworkController extends CallbackController<SignalCallback>, D
          * @param subId subscription ID for which to update the UI
          * @param roaming indicates roaming
          */
-        default void setMobileDataIndicators(IconState statusIcon, IconState qsIcon, int statusType,
-                int qsType, boolean activityIn, boolean activityOut,
-                CharSequence typeContentDescription,
-                CharSequence typeContentDescriptionHtml, CharSequence description,
-                boolean isWide, int subId, boolean roaming) {
+        default void setMobileDataIndicators(IconState statusIcon, IconState qsIcon,
+                int statusType, int qsType, boolean activityIn, boolean activityOut,
+                CharSequence typeContentDescription, CharSequence typeContentDescriptionHtml,
+                CharSequence description, boolean isWide, int subId, boolean roaming,
+                boolean isMobileImsLte, boolean isMobileImsWifi ) {
         }
 
         default void setSubs(List<SubscriptionInfo> subs) {}

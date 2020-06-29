@@ -19,10 +19,12 @@ import android.content.Context;
 import android.content.Intent;
 import android.database.ContentObserver;
 import android.net.NetworkCapabilities;
+import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.provider.Settings.Global;
+import android.telephony.AccessNetworkConstants;
 import android.telephony.NetworkRegistrationInfo;
 import android.telephony.PhoneStateListener;
 import android.telephony.ServiceState;
@@ -30,6 +32,10 @@ import android.telephony.SignalStrength;
 import android.telephony.SubscriptionInfo;
 import android.telephony.SubscriptionManager;
 import android.telephony.TelephonyManager;
+import android.telephony.ims.ImsException;
+import android.telephony.ims.ImsMmTelManager;
+import android.telephony.ims.ImsMmTelManager.RegistrationCallback;
+import android.telephony.ims.ImsReasonInfo;
 import android.text.Html;
 import android.text.TextUtils;
 import android.util.Log;
@@ -41,11 +47,13 @@ import com.android.internal.telephony.cdma.EriInfo;
 import com.android.settingslib.Utils;
 import com.android.settingslib.graph.SignalDrawable;
 import com.android.settingslib.net.SignalStrengthUtil;
+import com.android.systemui.Dependency;
 import com.android.systemui.R;
 import com.android.systemui.statusbar.policy.NetworkController.IconState;
 import com.android.systemui.statusbar.policy.NetworkController.SignalCallback;
 import com.android.systemui.statusbar.policy.NetworkControllerImpl.Config;
 import com.android.systemui.statusbar.policy.NetworkControllerImpl.SubscriptionDefaults;
+import com.android.systemui.tuner.TunerService;
 
 import java.io.PrintWriter;
 import java.util.BitSet;
@@ -55,12 +63,14 @@ import java.util.regex.Pattern;
 
 
 public class MobileSignalController extends SignalController<
-        MobileSignalController.MobileState, MobileSignalController.MobileIconGroup> {
+        MobileSignalController.MobileState, MobileSignalController.MobileIconGroup>
+        implements TunerService.Tunable {
 
     // The message to display Nr5G icon gracfully by CarrierConfig timeout
     private static final int MSG_DISPLAY_GRACE = 1;
 
     private final TelephonyManager mPhone;
+    private final ImsMmTelManager mImsManager;
     private final SubscriptionDefaults mDefaults;
     private final String mNetworkNameDefault;
     private final String mNetworkNameSeparator;
@@ -90,12 +100,70 @@ public class MobileSignalController extends SignalController<
     // Some specific carriers have 5GE network which is special LTE CA network.
     private static final int NETWORK_TYPE_LTE_CA_5GE = TelephonyManager.MAX_NETWORK_TYPE + 1;
 
+    private static final String SHOW_IMS_ICON = "show_ims_icon";
+    private boolean mVowifiRegistered;
+    private boolean mVolteRegistered;
+    private boolean mShowImsIcon;
+    private boolean mShowVoWifiIcon;
+
+    // Ims Registration callback that notifies the state of IMS
+    private final RegistrationCallback mImsRegistrationCallback = new RegistrationCallback() {
+                @Override
+                public void onRegistered(int imsRadioTech) {
+                   switch (imsRadioTech){
+                       case AccessNetworkConstants.TRANSPORT_TYPE_WWAN:
+                           mVowifiRegistered = false;
+                           mVolteRegistered = mImsManager != null &&
+                                   mImsManager.isAdvancedCallingSettingEnabled();
+                           break;
+                       case AccessNetworkConstants.TRANSPORT_TYPE_WLAN:
+                           mVowifiRegistered = mImsManager != null &&
+                                   mImsManager.isVoWiFiSettingEnabled();
+                           mVolteRegistered = false;
+                           break;
+                       default:
+                           mVowifiRegistered = false;
+                           mVolteRegistered = false;
+                           break;
+                   }
+                    Log.d(mTag, "Registered - Vowifi :" + mVowifiRegistered + ", volte :" + mVolteRegistered);
+                    updateTelephony();
+                }
+
+                @Override
+                public void onRegistering(int imsRadioTech) {
+                    mVowifiRegistered = false;
+                    mVolteRegistered = false;
+                    Log.d(mTag, "Onregistering - Vowifi :" + mVowifiRegistered + ", volte :" + mVolteRegistered);
+                    updateTelephony();
+                }
+
+                @Override
+                public void onTechnologyChangeFailed(int imsRadioTech, ImsReasonInfo info) {
+                    mVowifiRegistered = false;
+                    mVolteRegistered = false;
+                    Log.d(mTag, "Technology failure - Vowifi :" + mVowifiRegistered + ", volte :" + mVolteRegistered);
+                    updateTelephony();
+
+                }
+
+                @Override
+                public void onUnregistered(ImsReasonInfo info) {
+                    mVowifiRegistered = false;
+                    mVolteRegistered = false;
+                    Log.d(mTag, "Unregistered - Vowifi :" + mVowifiRegistered + ", volte :" + mVolteRegistered);
+                    updateTelephony();
+
+                }
+            };
+
+
     // TODO: Reduce number of vars passed in, if we have the NetworkController, probably don't
     // need listener lists anymore.
     public MobileSignalController(Context context, Config config, boolean hasMobileData,
             TelephonyManager phone, CallbackHandler callbackHandler,
             NetworkControllerImpl networkController, SubscriptionInfo info,
-            SubscriptionDefaults defaults, Looper receiverLooper) {
+            SubscriptionDefaults defaults, Looper receiverLooper){
         super("MobileSignalController(" + info.getSubscriptionId() + ")", context,
                 NetworkCapabilities.TRANSPORT_CELLULAR, callbackHandler,
                 networkController);
@@ -104,6 +172,15 @@ public class MobileSignalController extends SignalController<
         mPhone = phone;
         mDefaults = defaults;
         mSubscriptionInfo = info;
+        mImsManager =
+                ImsMmTelManager.createForSubscriptionId(mSubscriptionInfo.getSubscriptionId());
+        try{
+            mImsManager.registerImsRegistrationCallback(context.getMainExecutor(), mImsRegistrationCallback);
+        }
+        catch (ImsException e){
+                Log.d(mTag, "illegal subscription ID - Imsregistrationcallback failed.");
+            }
+
         mPhoneStateListener = new MobilePhoneStateListener(receiverLooper);
         mNetworkNameSeparator = getStringIfExists(R.string.status_bar_network_name_separator)
                 .toString();
@@ -127,6 +204,7 @@ public class MobileSignalController extends SignalController<
             }
         };
 
+        Dependency.get(TunerService.class).addTunable(this, SHOW_IMS_ICON);
         mDisplayGraceHandler = new Handler(receiverLooper) {
             @Override
             public void handleMessage(Message msg) {
@@ -138,11 +216,26 @@ public class MobileSignalController extends SignalController<
         };
     }
 
+    @Override
+    public void onTuningChanged(String key, String newValue) {
+        Log.d(mTag, "Tuning Change :" + mVowifiRegistered + ", volte :" + mVolteRegistered);
+        switch (key) {
+            case SHOW_IMS_ICON:
+                mShowImsIcon =
+                TunerService.parseIntegerSwitch(newValue, false);
+                updateTelephony();
+        }
+    }
+
     public void setConfiguration(Config config) {
         mConfig = config;
         updateInflateSignalStrength();
         mapIconSets();
         updateTelephony();
+    }
+
+    public int getDataContentDescription() {
+        return getIcons().mDataContentDescription;
     }
 
     public void setAirplaneMode(boolean airplaneMode) {
@@ -354,7 +447,7 @@ public class MobileSignalController extends SignalController<
         callback.setMobileDataIndicators(statusIcon, qsIcon, typeIcon, qsTypeIcon,
                 activityIn, activityOut, dataContentDescription, dataContentDescriptionHtml,
                 description, icons.mIsWide, mSubscriptionInfo.getSubscriptionId(),
-                mCurrentState.roaming);
+                mCurrentState.roaming, mCurrentState.mMobileImsLte, mCurrentState.mMobileImsWifi);
     }
 
     @Override
@@ -485,6 +578,7 @@ public class MobileSignalController extends SignalController<
      * mDataState, and mSimState.  It should be called any time one of these is updated.
      * This will call listeners if necessary.
      */
+
     private final void updateTelephony() {
         if (DEBUG) {
             Log.d(mTag, "updateTelephonySignalStrength: hasService=" +
@@ -544,7 +638,10 @@ public class MobileSignalController extends SignalController<
                 && !TextUtils.isEmpty(mServiceState.getDataOperatorAlphaShort())) {
             mCurrentState.networkNameData = mServiceState.getDataOperatorAlphaShort();
         }
-
+        //Sets volte/vowifi icon status
+        Log.d(mTag, "UpdateTelephony - Vowifi :" + mVowifiRegistered + ", volte :" + mVolteRegistered);
+        mCurrentState.mMobileImsLte = mShowImsIcon && mVolteRegistered;
+        mCurrentState.mMobileImsWifi = mShowImsIcon && mVowifiRegistered;
         notifyListenersIfNecessary();
     }
 
@@ -775,6 +872,8 @@ public class MobileSignalController extends SignalController<
         boolean userSetup;
         boolean roaming;
         boolean defaultDataOff;  // Tracks the on/off state of the defaultDataSubscription
+        boolean mMobileImsLte;
+        boolean mMobileImsWifi;
 
         @Override
         public void copyFrom(State s) {
@@ -790,6 +889,8 @@ public class MobileSignalController extends SignalController<
             carrierNetworkChangeMode = state.carrierNetworkChangeMode;
             userSetup = state.userSetup;
             roaming = state.roaming;
+            mMobileImsLte = state.mMobileImsLte;
+            mMobileImsWifi = state.mMobileImsWifi;
             defaultDataOff = state.defaultDataOff;
         }
 
@@ -802,6 +903,8 @@ public class MobileSignalController extends SignalController<
             builder.append("networkNameData=").append(networkNameData).append(',');
             builder.append("dataConnected=").append(dataConnected).append(',');
             builder.append("roaming=").append(roaming).append(',');
+            builder.append("mobileImsLte=").append(mMobileImsLte).append(',');
+            builder.append("mobileImsWifi=").append(mMobileImsWifi).append(',');
             builder.append("isDefault=").append(isDefault).append(',');
             builder.append("isEmergency=").append(isEmergency).append(',');
             builder.append("airplaneMode=").append(airplaneMode).append(',');
@@ -824,6 +927,8 @@ public class MobileSignalController extends SignalController<
                     && ((MobileState) o).userSetup == userSetup
                     && ((MobileState) o).isDefault == isDefault
                     && ((MobileState) o).roaming == roaming
+                    && ((MobileState) o).mMobileImsLte == mMobileImsLte
+                    && ((MobileState) o).mMobileImsWifi == mMobileImsWifi
                     && ((MobileState) o).defaultDataOff == defaultDataOff;
         }
     }
